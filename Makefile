@@ -1,3 +1,3 @@
 
 all:
-	./scripts/fetch.py | ./scripts/generate.py > ./x86.hpp
+	./scripts/fetch.py | ./scripts/generate.py > ./include/x86.hpp
