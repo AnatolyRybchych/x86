@@ -1,0 +1,131 @@
+#!/bin/sh
+
+if which rlwrap >/dev/null 2>&1 && [ "$1" != "--norlwrap" ]; then
+    rlwrap $0 --norlwrap "$@"
+    exit $?
+fi
+
+TEMP_FILES=""
+
+mktmp(){
+    TEMP=$(mktemp)
+    TEMP_FILES="$TEMP_FILES $TEMP"
+    echo "$TEMP"
+}
+
+on_exit(){
+    rm -f "$TEMP_FILES"
+    exit 0
+}
+
+trap on_exit EXIT
+trap on_exit INT
+trap on_exit TERM
+
+in=$(mktmp)
+echo "BITS 64" >> "$in"
+
+offset_file=$(mktmp)
+get_offset(){
+    local val=$(cat "$offset_file")
+    echo $((val))
+}
+
+set_offset(){
+    local val=$1
+    echo $((val)) > "$offset_file"
+}
+
+cut_line(){
+    tmp=$(mktmp)
+    lines=$(wc -l "$tmp" | cut -d' ' -f1)
+    head -n $((lines-1)) "$in" > "$tmp"
+    mv "$tmp" "$in"
+}
+
+while :; do
+    printf '\033[0;90m%04X\033[0m:>> \033[0;32m' $(get_offset)
+    line=$(head -n 1)
+    printf '\033[0m'
+
+    case "$line" in
+    h)
+        echo 'h: help'
+        echo 'p: print all code'
+        echo 'b: print entire binary dump'
+        echo 'c: cut last line'
+        echo 'w <file>: save file'
+        echo 'l <file>: load file'
+        echo 'r <hex line>: raw data'
+        continue
+        ;;
+    w|"w ") echo "ERROR: missing required argument <file>"; continue ;;
+    "w "*)
+        file=$(echo "$line" | cut -d' ' -f2- | xargs)
+        [ -z "$file" ] && {
+            echo "ERROR: missing required argument <file>"
+        } || {
+            cat "$in" > "$file" && realpath "$file"
+        }
+
+        continue;;
+    r|"r ") echo "ERROR: missing required argument <hex string>"; continue ;;
+    "r "*)
+        tmp=$(mktemp) && {
+            lines=`echo "$line" \
+                | cut -d' ' -f2- \
+                | tr -d '[[:space:]]' \
+                | xxd -r -p \
+                | ndisasm -b 64 /dev/stdin \
+                | awk '{for(i=3; i <= NF; i++){printf "%s ", $i} printf "\n"}' \
+                | sed 's/,/, /g'`
+            echo "$lines"
+            echo "$lines" >> "$in"
+            rm -f tmp
+        }
+
+        ;;
+    c)
+        cut_line
+        set_offset 0
+
+        printf '\033[0;32m'
+        cat "$in"
+        printf '\033[0m'
+        ;;
+    p)
+        printf '\033[0;32m'
+        cat "$in"
+        printf '\033[0m'
+        continue;;
+    b)
+        set_offset 0
+        ;;
+    *)
+        echo "$line" >> "$in"
+        ;;
+    esac
+
+    (nasm -f bin -o /dev/stdout "$in" -Werror || {
+        offset=$(get_offset)
+        cut_line
+        continue
+    }) | dd bs="1" skip=$(get_offset) 2>/dev/null | {
+        while :; do
+            offset=$(get_offset)
+
+            out=$(dd bs="1" count=16 2>/dev/null | od -tx1)
+            [ $(echo "$out" | wc -l) != 2 ] && break
+
+            line=$(echo "$out" | head -n1)
+            cur=$(echo "$out" | tail -n1)
+
+            set_offset $((offset+cur))
+
+            hex=$(echo "$line" | cut -d' ' -f2-)
+            [ -z "$hex" ] && break
+
+            printf '\033[0;90m%04X\033[0m:   %s\n' $offset "$hex"
+        done
+    }
+done
