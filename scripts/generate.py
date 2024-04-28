@@ -63,15 +63,12 @@ def preproccess(inst) -> Obj:
     if primary_opcode in ['0F', 'F1']:
         raise Exception('Prefix')
 
-    mandatory_pref = inst.get('Prefix')
-    if mandatory_pref:
-        new.mandatory_pref = bytes.fromhex(mandatory_pref)
+    new.pref = inst.get('Prefix')
 
     reg_op = inst.get('Register/Opcode Field')
     new.reg_const = reg_op and re.match('^\d+$', reg_op) and int(reg_op)
 
-    new.opcode = (new.pref_0F and bytes.fromhex(new.pref_0F) or b'')
-    new.opcode += bytes.fromhex(primary_opcode)
+    new.opcode = bytes.fromhex(primary_opcode)
     new.opcode += (new.secondary_opcode and bytes.fromhex(new.secondary_opcode) or b'')
 
     new.ops = [
@@ -103,47 +100,59 @@ def instruction(inst, **overload) -> list[str]:
     def get(name, default=None):
         return overload.get(name, getattr(inst, name, default))
     
-    bytes = []
-    bytes += ['0x%02X' % b for b in get('mandatory_pref', [])]
-    bytes += ['0x%02X' % b for b in get('prefix', [])]
+    res_bytes = []
+
+    mandatory_pref = get('mandatory_pref')
+    vex = get('vex')
+    if mandatory_pref and not vex:
+        res_bytes += ['0x%02X' % b for b in mandatory_pref]
+    
+    pref_0F = get('pref_0F')
+    if pref_0F and not vex:
+        res_bytes += [f'0x{pref_0F}']
+
+    res_bytes += ['0x%02X' % b if type(b) is int else b for b in get('prefix', [])]
+
+    if vex:
+        res_bytes += ['0x%02X' % b if type(b) is int else b for b in vex]
+
     opcode = ['0x%02X' % b for b in inst.opcode]
 
     if get('reg_in_op', False):
         opcode[-1] = f'U8({opcode[-1]}) + reg.id'
 
-    bytes += opcode
+    res_bytes += opcode
 
     mod_rm = get('mod_rm', None)
     mod = mod_rm and mod_rm.mod
     if mod_rm:
         mod_rm = f'mod_rm({f"{bin(mod)}"}, {mod_rm.reg}, {mod_rm.rm})'
-        bytes += [mod_rm]
+        res_bytes += [mod_rm]
 
     sib = get('sib', None)
     if sib:
         sib = f'sib({sib["scale"]}, {sib["index"]}, {sib["base"]})'
-        bytes += [sib]
+        res_bytes += [sib]
 
     disp = get('disp', [])
     if disp:
-        bytes += disp
+        res_bytes += disp
 
     imm = get('imm', None)
     if imm:
-        bytes += imm
+        res_bytes += imm
 
     lock = get('lock', False)
-    
 
     args: str =  ', '.join(get('args', []))
 
-    ret = f'Instruction<{len(bytes)}, {lock and mod != 0b11 and "true" or "false"}>'
+    ret = f'Instruction<{len(res_bytes)}, {lock and mod != 0b11 and "true" or "false"}>'
 
     return [
         '',
         f'// {get("mnemonic")} {", ".join(get("ops"))}; {get("description")}',
         f'static constexpr {ret} {get("mnemonic")}({args})' + '{',[
-            f'return {ret}' + '{' + ', '.join([ f'U8({b})' for b in bytes]) + '};',
+            f'return {ret}' + '{' + ', '.join([ f'U8({b})' for b in res_bytes]) + '};',
         ], '}'
     ]
 
@@ -164,6 +173,37 @@ def generate_instruction(inst) -> list[str]:
             if re.match(r'^r\d', arg):
                 inst.ops[i] = f'#{arg}'
                 break
+
+    def VEX(RXBWL: str, vvvv = None):
+        if not inst.pref_0F:
+            raise Exception("VEX prefix is not expected")
+
+        map_select = '00001'
+        if inst.secondary_opcode == '38':
+            map_select = '00010'
+        elif inst.secondary_opcode == '3A':
+            map_select = '00011'
+
+        pp = '00'
+        if inst.pref == '66':
+            pp = '01'
+        elif inst.pref == 'F3':
+            pp = '10'
+        elif inst.pref == 'F2':
+            pp = '11'
+
+        r, nr = 'R' in RXBWL and (1, 0) or (0, 1)
+        x, nx = 'X' in RXBWL and (1, 0) or (0, 1)
+        b, nb = 'B' in RXBWL and (1, 0) or (0, 1)
+        w, nw = 'W' in RXBWL and (1, 0) or (0, 1)
+        l, nl = 'L' in RXBWL and (1, 0) or (0, 1)
+
+        vvvv = vvvv or '0b1111'
+
+        if [x, b, w, map_select] == [0, 0, 0, '00001']:
+            return [f'0xC5', f'0b{nr}0000000 | (~{vvvv} & 0b1111)<<3 | 0b{l}{pp}']
+        else:
+            return [f'0xC5', int(f'{nr}{nx}{nb}{map_select}', 2), f'0b{w}0000{l}{pp} | ((~{vvvv} & 0b1111) << 3)']
 
     sib = {'scale': 'rm.scale', 'index': 'rm.index.id', 'base': 'rm.id'}
     ssesib = {'scale': 'xmmm.scale', 'index': 'xmmm.index.id', 'base': 'xmmm.id'}
@@ -1117,6 +1157,146 @@ def generate_instruction(inst) -> list[str]:
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EXMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EXMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EXMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'XMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'XMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'RegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'RegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'RegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'XMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'XMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'EXMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'EXMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'EXMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'EXMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'YMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'YMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'RegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'RegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'RegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'YMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'YMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'EYMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'EYMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'EYMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'EYMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
     ] for k in ['xmm,xmm/m128', 'xmm,xmm/m64', 'xmm,xmm/m32']},
     **{k: lambda: [
         *instruction(inst, args=['XMMM xmmm', 'XMM xmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
@@ -1184,10 +1364,166 @@ def generate_instruction(inst) -> list[str]:
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['SIB<ERegRm32Indir, EReg32> xmmm', 'EXMM xmm'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['SIB<ERegRm32Disp8, EReg32> xmmm', 'EXMM xmm'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['SIB<ERegRm32Disp32, EReg32> xmmm', 'EXMM xmm'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMMM xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['RegRm64Indir xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['RegRm64Disp8 xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['RegRm64Disp32 xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['XMMM xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['RegRm64Indir xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['RegRm64Disp8 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['RegRm64Disp32 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['EXMMM xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['ERegRm64Indir xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['ERegRm64Disp8 xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['ERegRm64Disp32 xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMMM xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['ERegRm64Indir xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['ERegRm64Disp8 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['ERegRm64Disp32 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['SIB<RegRm64Indir, Reg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['SIB<RegRm64Disp8, Reg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['SIB<RegRm64Disp32, Reg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, Reg64> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, Reg64> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, Reg64> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, Reg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, Reg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, Reg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['SIB<RegRm64Indir, EReg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['SIB<RegRm64Disp8, EReg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['SIB<RegRm64Disp32, EReg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, EReg64> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, EReg64> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, EReg64> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, EReg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, EReg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, EReg64> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['RegRm32Indir xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['RegRm32Disp8 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['RegRm32Disp32 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['ERegRm32Indir xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['ERegRm32Disp8 xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['ERegRm32Disp32 xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['ERegRm32Indir xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['ERegRm32Disp8 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['ERegRm32Disp32 xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['SIB<RegRm32Indir, Reg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['SIB<RegRm32Disp8, Reg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('R', 'xmm_extra.id'), args=['SIB<RegRm32Disp32, Reg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, Reg32> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, Reg32> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('B', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, Reg32> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, Reg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, Reg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, Reg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RX', 'xmm_extra.id'), args=['SIB<RegRm32Indir, EReg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RX', 'xmm_extra.id'), args=['SIB<RegRm32Disp8, EReg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RX', 'xmm_extra.id'), args=['SIB<RegRm32Disp32, EReg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('XB', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, EReg32> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('XB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, EReg32> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('XB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, EReg32> xmmm', 'XMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RXB', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, EReg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RXB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, EReg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('RXB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, EReg32> xmmm', 'EXMM xmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMMM xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['RegRm64Indir xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['RegRm64Disp8 xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['RegRm64Disp32 xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['YMMM xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['RegRm64Indir xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['RegRm64Disp8 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['RegRm64Disp32 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['EYMMM xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['ERegRm64Indir xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['ERegRm64Disp8 xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['ERegRm64Disp32 xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMMM xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['ERegRm64Indir xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['ERegRm64Disp8 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['ERegRm64Disp32 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['SIB<RegRm64Indir, Reg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['SIB<RegRm64Disp8, Reg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['SIB<RegRm64Disp32, Reg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, Reg64> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, Reg64> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, Reg64> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, Reg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, Reg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, Reg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['SIB<RegRm64Indir, EReg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['SIB<RegRm64Disp8, EReg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['SIB<RegRm64Disp32, EReg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, EReg64> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, EReg64> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, EReg64> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['SIB<ERegRm64Indir, EReg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp8, EReg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['SIB<ERegRm64Disp32, EReg64> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['RegRm32Indir xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['RegRm32Disp8 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['RegRm32Disp32 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['ERegRm32Indir xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['ERegRm32Disp8 xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['ERegRm32Disp32 xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['ERegRm32Indir xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['ERegRm32Disp8 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['ERegRm32Disp32 xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['SIB<RegRm32Indir, Reg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['SIB<RegRm32Disp8, Reg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LR', 'xmm_extra.id'), args=['SIB<RegRm32Disp32, Reg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, Reg32> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, Reg32> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, Reg32> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, Reg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, Reg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, Reg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRX', 'xmm_extra.id'), args=['SIB<RegRm32Indir, EReg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRX', 'xmm_extra.id'), args=['SIB<RegRm32Disp8, EReg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRX', 'xmm_extra.id'), args=['SIB<RegRm32Disp32, EReg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LXB', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, EReg32> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LXB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, EReg32> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LXB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, EReg32> xmmm', 'YMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRXB', 'xmm_extra.id'), args=['SIB<ERegRm32Indir, EReg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRXB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp8, EReg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', prefix=[SZOVRD], vex=VEX('LRXB', 'xmm_extra.id'), args=['SIB<ERegRm32Disp32, EReg32> xmmm', 'EYMM xmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
     ] for k in ['xmm/m128,xmm', 'xmm/m64,xmm', 'xmm/m32,xmm']},
     'xmm,xmm': lambda: [
         *instruction(inst, args=['XMM xmm', 'XMMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
         *instruction(inst, args=['XMM xmm', 'XMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[REX_R], args=['EXMM xmm', 'XMMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[REX_R], args=['EXMM xmm', 'XMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[REX_B], args=['XMM xmm', 'EXMMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[REX_B], args=['XMM xmm', 'EXMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[REX_RB], args=['EXMM xmm', 'EXMMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[REX_RB], args=['EXMM xmm', 'EXMM xmmm'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'XMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'XMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'XMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'XMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'EXMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'EXMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'EXMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'EXMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'YMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'YMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'YMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'YMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'EYMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'EYMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'EYMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'EYMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'xmm.id', 'xmmm.id')),
     ],
     **{k: lambda: [
         *instruction(inst, args=['XMM xmm', 'RegRm64Indir xmmm'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
@@ -1251,6 +1587,131 @@ def generate_instruction(inst) -> list[str]:
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EXMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EXMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EXMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'RegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'RegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['XMM xmm', 'RegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'RegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'ERegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'ERegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<RegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['XMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EXMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'RegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'RegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['YMM xmm', 'RegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'RegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'ERegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'xmm.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'ERegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'xmm.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<RegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['YMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'xmm.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'xmm.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EYMM xmm', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('xmmm.disp', 4)),
+    
     ] for k in ['xmm,m64', 'xmm,m32', 'xmm,m16']},
     **{k: lambda: [
         *instruction(inst, args=['Reg32 reg', 'XMMM xmmm'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
@@ -1322,6 +1783,146 @@ def generate_instruction(inst) -> list[str]:
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EReg32 reg', 'SIB<ERegRm32Indir, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EReg32 reg', 'SIB<ERegRm32Disp8, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EReg32 reg', 'SIB<ERegRm32Disp32, EReg32> xmmm'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['Reg32 reg', 'XMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['Reg32 reg', 'Reg32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['Reg32 reg', 'RegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['Reg32 reg', 'RegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('', 'xmm_extra.id'), args=['Reg32 reg', 'RegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'XMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'Reg32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'EXMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'EReg32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'EXMMM xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'EReg32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm64Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm64Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm64Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Indir, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Indir, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm32Indir xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm32Disp8 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm32Disp32 xmmm', 'XMM xmm_extra = XMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('R', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('B', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Indir, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('XB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Indir, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('RXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'XMM xmm_extra = XMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['Reg32 reg', 'YMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['Reg32 reg', 'Reg32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['Reg32 reg', 'RegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['Reg32 reg', 'RegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('L', 'xmm_extra.id'), args=['Reg32 reg', 'RegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'YMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'Reg32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'EYMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'EReg32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'EYMMM xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'EReg32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b11, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm64Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm64Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm64Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Indir, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp8, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp32, Reg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Indir, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp8, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm64Disp32, EReg64> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'RegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'ERegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm32Indir xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b00, 'reg.id', 'xmmm.id')),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm32Disp8 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b01, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'ERegRm32Disp32 xmmm', 'YMM xmm_extra = YMM0'], mod_rm=mod_rm(0b10, 'reg.id', 'xmmm.id'), disp=arr('xmmm.disp', 4)),
+
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LR', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Indir, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp8, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp32, Reg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRX', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<RegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LXB', 'xmm_extra.id'), args=['Reg32 reg', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Indir, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b00, 'reg.id', 0b100)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp8, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b01, 'reg.id', 0b100), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], mnemonic=f'V{inst.mnemonic}', vex=VEX('LRXB', 'xmm_extra.id'), args=['EReg32 reg', 'SIB<ERegRm32Disp32, EReg32> xmmm', 'YMM xmm_extra = YMM0'], sib=ssesib, mod_rm=mod_rm(0b10, 'reg.id', 0b100), disp=arr('xmmm.disp', 4)),
     ] for k in ['r32,xmm/m64', 'r32,xmm/m32']},
     **{k: lambda: [
         *instruction(inst, args=['MM mm', 'XMMM xmmm'], mod_rm=mod_rm(0b11, 'mm.id', 'xmmm.id')),
@@ -1420,7 +2021,34 @@ def generate_instruction(inst) -> list[str]:
         *instruction(inst, prefix=[SZOVRD, REX_RXB], args=['EXMM xmm', 'SIB<ERegRm32Disp32, EReg32> mmm'], sib=mmxsib, mod_rm=mod_rm(0b10, 'xmm.id', 0b100), disp=arr('mmm.disp', 4)),
     ],
     'xmm,imm8': lambda: [
-        *instruction(inst, imm=arr('imm', 1), mod_rm=mod_rm(0b11, inst.reg_const, 'xmmm.id'), args=[' XMMM xmmm', 'IMM8 imm']),
+        *instruction(inst, args=['XMMM xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b11, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, args=['XMM xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b11, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, args=['RegRm64Indir xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, args=['RegRm64Disp8 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, args=['RegRm64Disp32 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, args=['SIB<RegRm64Indir, Reg64> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1)),
+        *instruction(inst, args=['SIB<RegRm64Disp8, Reg64> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, args=['SIB<RegRm64Disp32, Reg64> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[REX_B], args=['EXMMM xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b11, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, prefix=[REX_B], args=['EXMM xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b11, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, prefix=[REX_B], args=['ERegRm64Indir xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, prefix=[REX_B], args=['ERegRm64Disp8 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[REX_B], args=['ERegRm64Disp32 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[REX_XB], args=['SIB<ERegRm64Indir, EReg64> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1)),
+        *instruction(inst, prefix=[REX_XB], args=['SIB<ERegRm64Disp8, EReg64> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[REX_XB], args=['SIB<ERegRm64Disp32, EReg64> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], args=['RegRm32Indir xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, prefix=[SZOVRD], args=['RegRm32Disp8 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], args=['RegRm32Disp32 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD], args=['SIB<RegRm32Indir, Reg32> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1)),
+        *instruction(inst, prefix=[SZOVRD], args=['SIB<RegRm32Disp8, Reg32> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD], args=['SIB<RegRm32Disp32, Reg32> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD, REX_B], args=['ERegRm32Indir xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1)),
+        *instruction(inst, prefix=[SZOVRD, REX_B], args=['ERegRm32Disp8 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD, REX_B], args=['ERegRm32Disp32 xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
+        *instruction(inst, prefix=[SZOVRD, REX_XB], args=['SIB<ERegRm32Indir, EReg32> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b00, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1)),
+        *instruction(inst, prefix=[SZOVRD, REX_XB], args=['SIB<ERegRm32Disp8, EReg32> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b01, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 1)),
+        *instruction(inst, prefix=[SZOVRD, REX_XB], args=['SIB<ERegRm32Disp32, EReg32> xmmm', 'IMM8 imm'], mod_rm=mod_rm(0b10, inst.reg_const, 'xmmm.id'), sib=ssesib, imm=arr('imm', 1), disp=arr('xmmm.disp', 4)),
     ],
     'mm,mm/m64': lambda: [
         *instruction(inst, args=['MM mm', 'MMM mmm'], mod_rm=mod_rm(0b11, 'mm.id', 'mmm.id')),
@@ -1669,6 +2297,15 @@ template <bool REGISTER_EXT>
 struct Register<RegisterType::SSE, RegisterMod::DIRECT, 128, REGISTER_EXT>
     :public Register<RegisterType::SSE, RegisterMod::NONE, 128, REGISTER_EXT>{};
 
+template <bool REGISTER_EXT>
+struct Register<RegisterType::AVX, RegisterMod::NONE, 256, REGISTER_EXT>{
+    RegId id;
+};
+
+template <bool REGISTER_EXT>
+struct Register<RegisterType::AVX, RegisterMod::DIRECT, 256, REGISTER_EXT>
+    :public Register<RegisterType::AVX, RegisterMod::NONE, 256, REGISTER_EXT>{};
+
 using Reg8 = Register<RegisterType::GP, RegisterMod::NONE, 8>;
 using Reg16 = Register<RegisterType::GP, RegisterMod::NONE, 16>;
 using Reg32 = Register<RegisterType::GP, RegisterMod::NONE, 32>;
@@ -1711,10 +2348,14 @@ using ERegRm64Disp32 = Register<RegisterType::GP, RegisterMod::LONG_DISPLACEMENT
 using MM = Register<RegisterType::MMX, RegisterMod::NONE, 64>;
 using XMM = Register<RegisterType::SSE, RegisterMod::NONE, 128>;
 using EXMM = Register<RegisterType::SSE, RegisterMod::NONE, 128, true>;
+using YMM = Register<RegisterType::AVX, RegisterMod::NONE, 256>;
+using EYMM = Register<RegisterType::AVX, RegisterMod::NONE, 256, true>;
 
 using MMM = Register<RegisterType::MMX, RegisterMod::DIRECT, 64>;
 using XMMM = Register<RegisterType::SSE, RegisterMod::DIRECT, 128>;
 using EXMMM = Register<RegisterType::SSE, RegisterMod::DIRECT, 128, true>;
+using YMMM = Register<RegisterType::AVX, RegisterMod::DIRECT, 256>;
+using EYMMM = Register<RegisterType::AVX, RegisterMod::DIRECT, 256, true>;
 
 using IMM8 = std::array<uint8_t, 1>;
 using IMM16 = std::array<uint8_t, 2>;
@@ -1814,14 +2455,31 @@ constexpr auto XMM4 = XMM{4};
 constexpr auto XMM5 = XMM{5};
 constexpr auto XMM6 = XMM{6};
 constexpr auto XMM7 = XMM{7};
-constexpr auto XMM8 = XMM{0};
-constexpr auto XMM9 = XMM{1};
-constexpr auto XMM10 = XMM{2};
-constexpr auto XMM11 = XMM{3};
-constexpr auto XMM12 = XMM{4};
-constexpr auto XMM13 = XMM{5};
-constexpr auto XMM14 = XMM{6};
-constexpr auto XMM15 = XMM{7};
+constexpr auto XMM8 = EXMM{0};
+constexpr auto XMM9 = EXMM{1};
+constexpr auto XMM10 = EXMM{2};
+constexpr auto XMM11 = EXMM{3};
+constexpr auto XMM12 = EXMM{4};
+constexpr auto XMM13 = EXMM{5};
+constexpr auto XMM14 = EXMM{6};
+constexpr auto XMM15 = EXMM{7};
+
+constexpr auto YMM0 = YMM{0};
+constexpr auto YMM1 = YMM{1};
+constexpr auto YMM2 = YMM{2};
+constexpr auto YMM3 = YMM{3};
+constexpr auto YMM4 = YMM{4};
+constexpr auto YMM5 = YMM{5};
+constexpr auto YMM6 = YMM{6};
+constexpr auto YMM7 = YMM{7};
+constexpr auto YMM8 = EYMM{0};
+constexpr auto YMM9 = EYMM{1};
+constexpr auto YMM10 = EYMM{2};
+constexpr auto YMM11 = EYMM{3};
+constexpr auto YMM12 = EYMM{4};
+constexpr auto YMM13 = EYMM{5};
+constexpr auto YMM14 = EYMM{6};
+constexpr auto YMM15 = EYMM{7};
 
 constexpr IMM8 imm8(uint8_t val){
     return IMM8{val};
